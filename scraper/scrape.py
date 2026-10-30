@@ -2,6 +2,8 @@
 
 Запускається в GitHub Actions кожні ~10 хвилин. Бере графік для адреси з сайту ДТЕК
 (потрібен браузер, бо сайт захищений від ботів) і надсилає його Worker-у.
+Окрім графіка передає поточне відключення для будинку (аварійне / планові роботи),
+якщо ДТЕК його показує: тип, причину, початок і орієнтовний кінець.
 """
 import asyncio
 import json
@@ -47,10 +49,15 @@ async def _browser_client(show_browser: bool):
 
 
 async def _fetch_with(client):
+    """Один запит getHomeNum: графік на сьогодні/завтра + поточне відключення будинку."""
     async with client as c:
-        today = await c.get_today_schedule(CITY, STREET, HOUSE)
-        tomorrow = await c.get_tomorrow_schedule(CITY, STREET, HOUSE)
-    return today, tomorrow
+        resp = await c.get_home_num(CITY, STREET)
+    entry = resp.houses.get(HOUSE)
+    today = tomorrow = None
+    if entry is not None and entry.primary_group and resp.fact is not None:
+        today = resp.fact.get_group_today(entry.primary_group)
+        tomorrow = resp.fact.get_group_day(resp.fact.today_ts + 86400, entry.primary_group)
+    return today, tomorrow, entry
 
 
 async def fetch_raw():
@@ -98,6 +105,45 @@ def to_intervals(slots):
     return result
 
 
+def _parse_dt(text):
+    """'26.03.2026 09:00' або '14:21 30.10.2026' -> ISO-рядок з київським часом (або None)."""
+    text = " ".join(str(text or "").split())
+    for fmt in ("%d.%m.%Y %H:%M", "%H:%M %d.%m.%Y", "%d.%m.%Y %H:%M:%S", "%H:%M:%S %d.%m.%Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=TZ).isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def to_outage(entry):
+    """Поточне відключення будинку з відповіді ДТЕК -> dict або None."""
+    if entry is None:
+        return None
+    reason = (entry.sub_type or "").strip()
+    start_raw = (entry.start_date or "").strip()
+    end_raw = (entry.end_date or "").strip()
+    if not reason and not start_raw:
+        return None
+    kind_raw = str(entry.outage_type or "").strip()
+    low = reason.lower()
+    if "авар" in low or "екстр" in low:
+        kind = "emergency"
+    elif kind_raw == "1" or "план" in low:
+        kind = "planned"
+    else:
+        kind = "other"
+    return {
+        "kind": kind,
+        "reason": reason[:200],
+        "start": _parse_dt(start_raw),
+        "end": _parse_dt(end_raw),
+        "start_raw": start_raw[:40],
+        "end_raw": end_raw[:40],
+        "type_raw": kind_raw[:10],
+    }
+
+
 def post(payload: dict) -> None:
     req = urllib.request.Request(
         f"{WORKER_URL}/ingest",
@@ -115,15 +161,20 @@ def post(payload: dict) -> None:
 
 async def main() -> None:
     try:
-        today_slots, tomorrow_slots = await fetch_raw()
+        today_slots, tomorrow_slots, entry = await fetch_raw()
         if not today_slots:
             raise DtekClientError("Графік для цієї адреси не знайдено (перевірте CITY/STREET/HOUSE)")
         today = datetime.now(TZ).date()
         days = {today.isoformat(): to_intervals(today_slots)}
         if tomorrow_slots:
             days[(today + timedelta(days=1)).isoformat()] = to_intervals(tomorrow_slots)
-        payload = {"ok": True, "days": days}
-        print("Графік отримано, днів:", len(days))
+        outage = None
+        try:
+            outage = to_outage(entry)
+        except Exception as e:  # noqa: BLE001  (поточне відключення — бонус, графік важливіший)
+            print("Не вдалося розібрати поточне відключення:", type(e).__name__, e, file=sys.stderr)
+        payload = {"ok": True, "days": days, "outage": outage}
+        print("Графік отримано, днів:", len(days), "| поточне відключення:", json.dumps(outage, ensure_ascii=False))
     except Exception as e:  # noqa: BLE001
         payload = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         print("Помилка:", payload["error"], file=sys.stderr)
