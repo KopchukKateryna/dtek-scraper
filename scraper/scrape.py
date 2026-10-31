@@ -4,11 +4,16 @@
 (потрібен браузер, бо сайт захищений від ботів) і надсилає його Worker-у.
 Окрім графіка передає поточне відключення для будинку (аварійне / планові роботи),
 якщо ДТЕК його показує: тип, причину, початок і орієнтовний кінець.
+
+Додаткові адреси (наприклад, «Сяйво Сро») скрапер питає у Worker-а (GET /ingest/targets):
+самі адреси в цьому публічному репозиторії не зберігаються. Їх обробляємо ПІСЛЯ основної
+адреси й надсилаємо окремо, тож збій на додатковій адресі не впливає на основну.
 """
 import asyncio
 import json
 import os
 import sys
+import time
 import urllib.request
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -24,20 +29,22 @@ WORKER_URL = os.environ["WORKER_URL"].rstrip("/")
 INGEST_TOKEN = os.environ["INGEST_TOKEN"]
 
 TZ = ZoneInfo("Europe/Kyiv")
+TARGET_BUDGET_S = 180  # не більше 3 хв на додаткову адресу (весь запуск обмежений 8 хв)
 BASE_URL = f"https://www.dtek-{SITE}.com.ua"
 
 
-async def _browser_client(show_browser: bool):
+async def _browser_client(show_browser: bool, site: str = SITE):
     from curl_cffi.requests import AsyncSession
     from dtek_client.browser_auth import get_cleared_cookies
 
-    schedule_url = f"{BASE_URL}/ua/shutdowns"
+    base_url = f"https://www.dtek-{site}.com.ua"
+    schedule_url = f"{base_url}/ua/shutdowns"
     cookies, csrf = await get_cleared_cookies(schedule_url, show_browser=show_browser)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "uk,en;q=0.9",
-        "Origin": BASE_URL,
+        "Origin": base_url,
         "Referer": schedule_url,
         "X-Requested-With": "XMLHttpRequest",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -45,14 +52,14 @@ async def _browser_client(show_browser: bool):
     if csrf:
         headers["X-CSRF-Token"] = csrf
     session = AsyncSession(timeout=15.0, headers=headers, cookies=cookies, impersonate="chrome120")
-    return DtekClient(SITE, ajax_url=f"{BASE_URL}/ua/ajax", session=session)
+    return DtekClient(site, ajax_url=f"{base_url}/ua/ajax", session=session)
 
 
-async def _fetch_with(client):
+async def _fetch_with(client, city=CITY, street=STREET, house=HOUSE):
     """Один запит getHomeNum: графік на сьогодні/завтра + поточне відключення будинку."""
     async with client as c:
-        resp = await c.get_home_num(CITY, STREET)
-    entry = resp.houses.get(HOUSE)
+        resp = await c.get_home_num(city, street)
+    entry = resp.houses.get(house)
     today = tomorrow = None
     if entry is not None and entry.primary_group and resp.fact is not None:
         today = resp.fact.get_group_today(entry.primary_group)
@@ -60,16 +67,16 @@ async def _fetch_with(client):
     return today, tomorrow, entry
 
 
-async def fetch_raw():
+async def fetch_raw(site=SITE, city=CITY, street=STREET, house=HOUSE):
     """Спершу звичайний запит, потім браузер (headless), потім браузер із вікном (під xvfb)."""
     errors = []
     try:
-        return await _fetch_with(DtekClient(SITE))
+        return await _fetch_with(DtekClient(site), city, street, house)
     except Exception as e:  # noqa: BLE001
         errors.append(f"plain: {type(e).__name__}")
     for show in (False, True):
         try:
-            return await _fetch_with(await _browser_client(show))
+            return await _fetch_with(await _browser_client(show, site), city, street, house)
         except Exception as e:  # noqa: BLE001
             errors.append(f"browser(show={show}): {type(e).__name__}: {e}")
     raise DtekClientError("; ".join(errors))
@@ -144,9 +151,9 @@ def to_outage(entry):
     }
 
 
-def post(payload: dict) -> None:
+def post(payload: dict, path: str = "/ingest") -> None:
     req = urllib.request.Request(
-        f"{WORKER_URL}/ingest",
+        f"{WORKER_URL}{path}",
         data=json.dumps(payload).encode(),
         headers={
             "Authorization": f"Bearer {INGEST_TOKEN}",
@@ -159,26 +166,79 @@ def post(payload: dict) -> None:
         print("Worker:", r.status, r.read().decode()[:200])
 
 
+def build_payload(today_slots, tomorrow_slots, entry):
+    today = datetime.now(TZ).date()
+    days = {today.isoformat(): to_intervals(today_slots)}
+    if tomorrow_slots:
+        days[(today + timedelta(days=1)).isoformat()] = to_intervals(tomorrow_slots)
+    outage = None
+    try:
+        outage = to_outage(entry)
+    except Exception as e:  # noqa: BLE001  (поточне відключення — бонус, графік важливіший)
+        print("Не вдалося розібрати поточне відключення:", type(e).__name__, e, file=sys.stderr)
+    return {"ok": True, "days": days, "outage": outage}
+
+
+def get_targets():
+    """Додаткові адреси з Worker-а: [{id, site, city, streets: [...], houses: [...]}]."""
+    req = urllib.request.Request(
+        f"{WORKER_URL}/ingest/targets",
+        headers={"Authorization": f"Bearer {INGEST_TOKEN}", "User-Agent": "dtek-scraper/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode()).get("targets", [])
+
+
+async def fetch_target(t):
+    """Пробуємо варіанти назви вулиці й номера будинку (на різних сайтах ДТЕК пишуть по-різному)."""
+    errors = []
+    started = time.monotonic()
+    for street in t.get("streets") or []:
+        for house in t.get("houses") or []:
+            if time.monotonic() - started > TARGET_BUDGET_S:
+                errors.append("перевищено час на додаткову адресу")
+                raise DtekClientError("; ".join(errors)[:600])
+            try:
+                today_slots, tomorrow_slots, entry = await fetch_raw(t["site"], t["city"], street, house)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{street}/{house}: {type(e).__name__}: {e}"[:200])
+                continue
+            if today_slots:
+                return build_payload(today_slots, tomorrow_slots, entry)
+            errors.append(f"{street}/{house}: будинок або графік не знайдено")
+    raise DtekClientError("; ".join(errors)[:600] or "немає варіантів адреси")
+
+
 async def main() -> None:
     try:
         today_slots, tomorrow_slots, entry = await fetch_raw()
         if not today_slots:
             raise DtekClientError("Графік для цієї адреси не знайдено (перевірте CITY/STREET/HOUSE)")
-        today = datetime.now(TZ).date()
-        days = {today.isoformat(): to_intervals(today_slots)}
-        if tomorrow_slots:
-            days[(today + timedelta(days=1)).isoformat()] = to_intervals(tomorrow_slots)
-        outage = None
-        try:
-            outage = to_outage(entry)
-        except Exception as e:  # noqa: BLE001  (поточне відключення — бонус, графік важливіший)
-            print("Не вдалося розібрати поточне відключення:", type(e).__name__, e, file=sys.stderr)
-        payload = {"ok": True, "days": days, "outage": outage}
-        print("Графік отримано, днів:", len(days), "| поточне відключення:", json.dumps(outage, ensure_ascii=False))
+        payload = build_payload(today_slots, tomorrow_slots, entry)
+        print("Графік отримано, днів:", len(payload["days"]), "| поточне відключення:", json.dumps(payload["outage"], ensure_ascii=False))
     except Exception as e:  # noqa: BLE001
         payload = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         print("Помилка:", payload["error"], file=sys.stderr)
     post(payload)
+
+    # додаткові адреси — після основної і окремими запитами, щоб не заважати їй
+    try:
+        targets = get_targets()
+    except Exception as e:  # noqa: BLE001
+        print("Додаткові адреси недоступні:", type(e).__name__, e, file=sys.stderr)
+        return
+    for t in targets:
+        tid = str(t.get("id", ""))
+        try:
+            data = await fetch_target(t)
+            print(f"[{tid}] графік отримано, днів:", len(data["days"]))
+        except Exception as e:  # noqa: BLE001
+            data = {"ok": False, "error": f"{type(e).__name__}: {e}"[:600]}
+            print(f"[{tid}] помилка:", data["error"], file=sys.stderr)
+        try:
+            post({"id": tid, **data}, "/ingest/target")
+        except Exception as e:  # noqa: BLE001
+            print(f"[{tid}] не вдалося надіслати:", type(e).__name__, e, file=sys.stderr)
 
 
 if __name__ == "__main__":
