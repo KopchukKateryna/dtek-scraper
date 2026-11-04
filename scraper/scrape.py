@@ -11,6 +11,7 @@
 """
 import asyncio
 import json
+import re
 import os
 import sys
 import time
@@ -151,6 +152,64 @@ def to_outage(entry):
     }
 
 
+NOTICE_START = "шановні клієнти"
+NOTICE_END = ("дякуємо",)
+
+
+def parse_notice(page_text):
+    """Текст сторінки відключень -> оголошення ДТЕК (вікно «Шановні клієнти!») або «немає».
+
+    Шукаємо саме це вікно, а не будь-які згадки на сторінці (у довідці теж пишуть про
+    екстрені відключення). Повертає {active, noSchedule, text}.
+    """
+    lines = [" ".join(l.split()) for l in str(page_text or "").splitlines()]
+    lines = [l for l in lines if l]
+    start = next((i for i, l in enumerate(lines) if l.lower().startswith(NOTICE_START)), None)
+    if start is None:
+        return {"active": False, "noSchedule": False, "text": ""}
+    body = []
+    for l in lines[start + 1:start + 20]:
+        if l.lower().startswith(NOTICE_END) or l.lower().startswith(NOTICE_START):
+            break
+        body.append(l)
+    text = " ".join(body)[:600]
+    low = text.lower()
+    # лише справжні екстрені («введені / діють екстрені відключення»), а не «щоб уникнути екстрених»
+    emergency = re.search(r"(введен\w*|запроваджен\w*|застосован\w*|діють)\s+(\S+\s+)?екстрен", low) is not None
+    no_schedule = emergency and ("не діють" in low or "не діє" in low)
+    # показуємо лише важливе: екстрені відключення або аварія (звичайні оголошення — ні)
+    active = emergency or "авар" in low
+    return {"active": active, "noSchedule": no_schedule, "text": text if active else ""}
+
+
+async def fetch_notice(site=SITE):
+    """Відкриває сторінку відключень у браузері (сайт захищений) і читає оголошення ДТЕК.
+
+    None — сторінку прочитати не вдалося (тоді Сяйво лишає попередній стан).
+    """
+    from playwright.async_api import async_playwright
+
+    url = f"https://www.dtek-{site}.com.ua/ua/shutdowns"
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        try:
+            page = await browser.new_page(locale="uk-UA")
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            text = ""
+            for _ in range(20):  # захист сайту спершу показує перевірку — чекаємо справжню сторінку
+                await page.wait_for_timeout(1500)
+                text = await page.evaluate("document.body ? document.body.innerText : ''")
+                if "графік" in text.lower() and len(text) > 2000:
+                    break
+            else:
+                return None
+            await page.wait_for_timeout(2500)  # оголошення з'являється вікном трохи пізніше
+            text = await page.evaluate("document.body ? document.body.innerText : ''")
+            return parse_notice(text)
+        finally:
+            await browser.close()
+
+
 def post(payload: dict, path: str = "/ingest") -> None:
     req = urllib.request.Request(
         f"{WORKER_URL}{path}",
@@ -219,6 +278,13 @@ async def main() -> None:
     except Exception as e:  # noqa: BLE001
         payload = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         print("Помилка:", payload["error"], file=sys.stderr)
+    if payload.get("ok"):
+        # оголошення ДТЕК («екстрені відключення, графіки не діють») — бонус: збій не заважає графіку
+        try:
+            payload["notice"] = await asyncio.wait_for(fetch_notice(), timeout=90)
+            print("Оголошення ДТЕК:", json.dumps(payload["notice"], ensure_ascii=False)[:400])
+        except Exception as e:  # noqa: BLE001
+            print("Оголошення ДТЕК не прочитано:", type(e).__name__, e, file=sys.stderr)
     post(payload)
 
     # додаткові адреси — після основної і окремими запитами, щоб не заважати їй
@@ -232,6 +298,11 @@ async def main() -> None:
         try:
             data = await fetch_target(t)
             print(f"[{tid}] графік отримано, днів:", len(data["days"]))
+            try:
+                data["notice"] = await asyncio.wait_for(fetch_notice(t["site"]), timeout=90)
+                print(f"[{tid}] оголошення ДТЕК:", json.dumps(data["notice"], ensure_ascii=False)[:400])
+            except Exception as e:  # noqa: BLE001
+                print(f"[{tid}] оголошення ДТЕК не прочитано:", type(e).__name__, e, file=sys.stderr)
         except Exception as e:  # noqa: BLE001
             data = {"ok": False, "error": f"{type(e).__name__}: {e}"[:600]}
             print(f"[{tid}] помилка:", data["error"], file=sys.stderr)
