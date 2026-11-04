@@ -182,6 +182,21 @@ def parse_notice(page_text):
     return {"active": active, "noSchedule": no_schedule, "text": text if active else ""}
 
 
+NOTICE_JS = """() => {
+  const leaf = [...document.querySelectorAll('body *')]
+    .filter(e => e.children.length === 0 && /шановні\\s+клієнти/i.test(e.textContent || ''))[0];
+  if (!leaf) return null;
+  let box = leaf;
+  while (box.parentElement && box.parentElement !== document.body && !/дякуємо/i.test(box.textContent || '')
+         && (box.textContent || '').length < 5000) box = box.parentElement;
+  for (let n = box; n && n !== document.body; n = n.parentElement) {
+    if (getComputedStyle(n).display === 'none') n.style.setProperty('display', 'block', 'important');
+    n.style.setProperty('visibility', 'visible', 'important');
+  }
+  return box.innerText || box.textContent || null;
+}"""
+
+
 async def fetch_notice(site=SITE):
     """Відкриває сторінку відключень у браузері (сайт захищений) і читає оголошення ДТЕК.
 
@@ -204,8 +219,13 @@ async def fetch_notice(site=SITE):
             else:
                 return None
             await page.wait_for_timeout(2500)  # оголошення з'являється вікном трохи пізніше
-            text = await page.evaluate("document.body ? document.body.innerText : ''")
-            return parse_notice(text)
+            # вікно «Шановні клієнти!» може бути приховане (показується пізніше) — знаходимо його в коді
+            # сторінки, тимчасово робимо видимим і беремо текст із розбивкою на рядки
+            box = await page.evaluate(NOTICE_JS)
+            html = await page.content()
+            print(f"[{site}] вікно «Шановні клієнти!»:", "знайдено" if box else "не знайдено",
+                  "| у коді сторінки:", "є" if NOTICE_START in html.lower() else "немає")
+            return parse_notice(box or text)
         finally:
             await browser.close()
 
