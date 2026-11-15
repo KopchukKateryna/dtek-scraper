@@ -5,6 +5,10 @@
 Окрім графіка передає поточне відключення для будинку (аварійне / планові роботи),
 якщо ДТЕК його показує: тип, причину, початок і орієнтовний кінець.
 
+Після повної перевірки скрапер «чергує» до кінця запуску (WATCH_SECONDS): щохвилини робить один
+легкий запит графіка (без нового браузера й без оголошення) і одразу надсилає, якщо графік чи
+відключення змінилися. Так новий графік доходить до Сяйва за 1–2 хв, а не до 10.
+
 Додаткові адреси (наприклад, «Сяйво Сро») скрапер питає у Worker-а (GET /ingest/targets):
 самі адреси в цьому публічному репозиторії не зберігаються. Їх обробляємо ПІСЛЯ основної
 адреси й надсилаємо окремо, тож збій на додатковій адресі не впливає на основну.
@@ -30,17 +34,29 @@ WORKER_URL = os.environ["WORKER_URL"].rstrip("/")
 INGEST_TOKEN = os.environ["INGEST_TOKEN"]
 
 TZ = ZoneInfo("Europe/Kyiv")
-TARGET_BUDGET_S = 180  # не більше 3 хв на додаткову адресу (весь запуск обмежений 8 хв)
+TARGET_BUDGET_S = 180  # не більше 3 хв на додаткову адресу
 BASE_URL = f"https://www.dtek-{SITE}.com.ua"
 
+# «чергування»: скільки секунд від старту скрипта стежити за змінами (0 — вимкнено) і як часто
+WATCH_SECONDS = int(os.getenv("WATCH_SECONDS", "0") or 0)
+WATCH_EVERY_S = max(30, int(os.getenv("WATCH_EVERY_SECONDS", "60") or 60))
+STARTED = time.monotonic()
 
-async def _browser_client(show_browser: bool, site: str = SITE):
+_COOKIES = {}   # site -> (cookies, csrf) після браузерної перевірки — щоб не відкривати браузер щохвилини
+_PLAIN_OK = {}  # site -> чи спрацював звичайний запит без браузера
+
+
+async def _browser_client(show_browser: bool, site: str = SITE, reuse: bool = False):
     from curl_cffi.requests import AsyncSession
     from dtek_client.browser_auth import get_cleared_cookies
 
     base_url = f"https://www.dtek-{site}.com.ua"
     schedule_url = f"{base_url}/ua/shutdowns"
-    cookies, csrf = await get_cleared_cookies(schedule_url, show_browser=show_browser)
+    if reuse and site in _COOKIES:
+        cookies, csrf = _COOKIES[site]
+    else:
+        cookies, csrf = await get_cleared_cookies(schedule_url, show_browser=show_browser)
+        _COOKIES[site] = (cookies, csrf)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -72,8 +88,11 @@ async def fetch_raw(site=SITE, city=CITY, street=STREET, house=HOUSE):
     """Спершу звичайний запит, потім браузер (headless), потім браузер із вікном (під xvfb)."""
     errors = []
     try:
-        return await _fetch_with(DtekClient(site), city, street, house)
+        res = await _fetch_with(DtekClient(site), city, street, house)
+        _PLAIN_OK[site] = True
+        return res
     except Exception as e:  # noqa: BLE001
+        _PLAIN_OK[site] = False
         errors.append(f"plain: {type(e).__name__}")
     for show in (False, True):
         try:
@@ -81,6 +100,21 @@ async def fetch_raw(site=SITE, city=CITY, street=STREET, house=HOUSE):
         except Exception as e:  # noqa: BLE001
             errors.append(f"browser(show={show}): {type(e).__name__}: {e}")
     raise DtekClientError("; ".join(errors))
+
+
+async def fetch_quick(site, city, street, house):
+    """Легкий повторний запит для «чергування»: тим способом, що вже спрацював, без нового браузера."""
+    if _PLAIN_OK.get(site):
+        try:
+            return await _fetch_with(DtekClient(site), city, street, house)
+        except Exception:  # noqa: BLE001
+            _PLAIN_OK[site] = False
+    if site in _COOKIES:
+        try:
+            return await _fetch_with(await _browser_client(False, site, reuse=True), city, street, house)
+        except Exception:  # noqa: BLE001
+            _COOKIES.pop(site, None)  # cookies застаріли — далі повна спроба з браузером
+    return await fetch_raw(site, city, street, house)
 
 
 def to_intervals(slots):
@@ -283,12 +317,60 @@ async def fetch_target(t):
                 errors.append(f"{street}/{house}: {type(e).__name__}: {e}"[:200])
                 continue
             if today_slots:
-                return build_payload(today_slots, tomorrow_slots, entry)
+                return build_payload(today_slots, tomorrow_slots, entry), street, house
             errors.append(f"{street}/{house}: будинок або графік не знайдено")
     raise DtekClientError("; ".join(errors)[:600] or "немає варіантів адреси")
 
 
+def signature(payload: dict) -> str:
+    """Що порівнюємо між перевірками: графік і поточне відключення (оголошення — лише в повній перевірці)."""
+    return json.dumps({"days": payload.get("days"), "outage": payload.get("outage")}, sort_keys=True, ensure_ascii=False)
+
+
+def near_midnight() -> bool:
+    """23:55–00:10 за Києвом: ДТЕК може ще віддавати вчорашнє «сьогодні» — у чергуванні пропускаємо."""
+    t = datetime.now(TZ)
+    return (t.hour == 23 and t.minute >= 55) or (t.hour == 0 and t.minute < 10)
+
+
+async def watch(spots: list, sent: dict) -> None:
+    """Щохвилини легкий запит по кожній адресі; надсилаємо лише коли графік / відключення змінилися."""
+    if WATCH_SECONDS <= 0 or not spots:
+        return
+    deadline = STARTED + WATCH_SECONDS
+    checks = changes = 0
+    while True:
+        next_at = time.monotonic() + WATCH_EVERY_S
+        if next_at > deadline:
+            break
+        await asyncio.sleep(next_at - time.monotonic())
+        if near_midnight():
+            continue
+        checks += 1
+        for spot in spots:
+            label = spot["label"]
+            try:
+                today_slots, tomorrow_slots, entry = await asyncio.wait_for(
+                    fetch_quick(spot["site"], spot["city"], spot["street"], spot["house"]), timeout=50)
+                if not today_slots:
+                    print(f"[{label}] чергування: графік не знайдено", file=sys.stderr)
+                    continue
+                payload = build_payload(today_slots, tomorrow_slots, entry)
+                sig = signature(payload)
+                if sig == sent.get(label):
+                    continue
+                print(f"[{label}] чергування: зміна о {datetime.now(TZ):%H:%M:%S}, днів: {len(payload['days'])} — надсилаю")
+                post({"id": spot["id"], **payload} if spot["id"] else payload, spot["path"])
+                sent[label] = sig
+                changes += 1
+            except Exception as e:  # noqa: BLE001
+                print(f"[{label}] чергування: помилка {type(e).__name__}", file=sys.stderr)
+    print(f"Чергування завершено: перевірок {checks}, надіслано змін {changes}")
+
+
 async def main() -> None:
+    sent = {}   # label -> підпис останніх надісланих даних
+    spots = [{"label": "наша", "id": None, "path": "/ingest", "site": SITE, "city": CITY, "street": STREET, "house": HOUSE}]
     try:
         today_slots, tomorrow_slots, entry = await fetch_raw()
         if not today_slots:
@@ -305,18 +387,25 @@ async def main() -> None:
             print("Оголошення ДТЕК:", json.dumps(payload["notice"], ensure_ascii=False)[:400])
         except Exception as e:  # noqa: BLE001
             print("Оголошення ДТЕК не прочитано:", type(e).__name__, e, file=sys.stderr)
-    post(payload)
+    try:
+        post(payload)
+        if payload.get("ok"):
+            sent["наша"] = signature(payload)
+    except Exception as e:  # noqa: BLE001
+        print("Не вдалося надіслати:", type(e).__name__, e, file=sys.stderr)
 
     # додаткові адреси — після основної і окремими запитами, щоб не заважати їй
     try:
         targets = get_targets()
     except Exception as e:  # noqa: BLE001
         print("Додаткові адреси недоступні:", type(e).__name__, e, file=sys.stderr)
-        return
+        targets = []
     for t in targets:
         tid = str(t.get("id", ""))
+        found = None
         try:
-            data = await fetch_target(t)
+            data, street, house = await fetch_target(t)
+            found = (street, house)
             print(f"[{tid}] графік отримано, днів:", len(data["days"]))
             try:
                 data["notice"] = await asyncio.wait_for(fetch_notice(t["site"]), timeout=90)
@@ -328,8 +417,15 @@ async def main() -> None:
             print(f"[{tid}] помилка:", data["error"], file=sys.stderr)
         try:
             post({"id": tid, **data}, "/ingest/target")
+            if data.get("ok"):
+                sent[tid] = signature(data)
         except Exception as e:  # noqa: BLE001
             print(f"[{tid}] не вдалося надіслати:", type(e).__name__, e, file=sys.stderr)
+        if found:
+            spots.append({"label": tid, "id": tid, "path": "/ingest/target", "site": t["site"],
+                          "city": t["city"], "street": found[0], "house": found[1]})
+
+    await watch(spots, sent)
 
 
 if __name__ == "__main__":

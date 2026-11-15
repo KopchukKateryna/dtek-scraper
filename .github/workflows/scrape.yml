@@ -12,7 +12,7 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
 
@@ -34,6 +34,9 @@ jobs:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
           DTEK_SITE: krem
+          # «чергування»: після повної перевірки ще ~7 хв щохвилини дивитися, чи змінився графік
+          WATCH_SECONDS: "470"
+          WATCH_EVERY_SECONDS: "60"
           CITY: ${{ secrets.CITY }}
           STREET: ${{ secrets.STREET }}
           HOUSE: ${{ secrets.HOUSE }}
