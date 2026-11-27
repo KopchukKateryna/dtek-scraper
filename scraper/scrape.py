@@ -8,10 +8,6 @@
 Після повної перевірки скрапер «чергує» до кінця запуску (WATCH_SECONDS): щохвилини робить один
 легкий запит графіка (без нового браузера й без оголошення) і одразу надсилає, якщо графік чи
 відключення змінилися. Так новий графік доходить до Сяйва за 1–2 хв, а не до 10.
-
-Додаткові адреси (наприклад, «Сяйво Сро») скрапер питає у Worker-а (GET /ingest/targets):
-самі адреси в цьому публічному репозиторії не зберігаються. Їх обробляємо ПІСЛЯ основної
-адреси й надсилаємо окремо, тож збій на додатковій адресі не впливає на основну.
 """
 import asyncio
 import json
@@ -34,7 +30,6 @@ WORKER_URL = os.environ["WORKER_URL"].rstrip("/")
 INGEST_TOKEN = os.environ["INGEST_TOKEN"]
 
 TZ = ZoneInfo("Europe/Kyiv")
-TARGET_BUDGET_S = 180  # не більше 3 хв на додаткову адресу
 BASE_URL = f"https://www.dtek-{SITE}.com.ua"
 
 # «чергування»: скільки секунд від старту скрипта стежити за змінами (0 — вимкнено) і як часто
@@ -292,36 +287,6 @@ def build_payload(today_slots, tomorrow_slots, entry):
     return {"ok": True, "days": days, "outage": outage}
 
 
-def get_targets():
-    """Додаткові адреси з Worker-а: [{id, site, city, streets: [...], houses: [...]}]."""
-    req = urllib.request.Request(
-        f"{WORKER_URL}/ingest/targets",
-        headers={"Authorization": f"Bearer {INGEST_TOKEN}", "User-Agent": "dtek-scraper/1.0"},
-    )
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read().decode()).get("targets", [])
-
-
-async def fetch_target(t):
-    """Пробуємо варіанти назви вулиці й номера будинку (на різних сайтах ДТЕК пишуть по-різному)."""
-    errors = []
-    started = time.monotonic()
-    for street in t.get("streets") or []:
-        for house in t.get("houses") or []:
-            if time.monotonic() - started > TARGET_BUDGET_S:
-                errors.append("перевищено час на додаткову адресу")
-                raise DtekClientError("; ".join(errors)[:600])
-            try:
-                today_slots, tomorrow_slots, entry = await fetch_raw(t["site"], t["city"], street, house)
-            except Exception as e:  # noqa: BLE001
-                errors.append(f"{street}/{house}: {type(e).__name__}: {e}"[:200])
-                continue
-            if today_slots:
-                return build_payload(today_slots, tomorrow_slots, entry), street, house
-            errors.append(f"{street}/{house}: будинок або графік не знайдено")
-    raise DtekClientError("; ".join(errors)[:600] or "немає варіантів адреси")
-
-
 def signature(payload: dict) -> str:
     """Що порівнюємо між перевірками: графік і поточне відключення (оголошення — лише в повній перевірці)."""
     return json.dumps({"days": payload.get("days"), "outage": payload.get("outage")}, sort_keys=True, ensure_ascii=False)
@@ -393,37 +358,6 @@ async def main() -> None:
             sent["наша"] = signature(payload)
     except Exception as e:  # noqa: BLE001
         print("Не вдалося надіслати:", type(e).__name__, e, file=sys.stderr)
-
-    # додаткові адреси — після основної і окремими запитами, щоб не заважати їй
-    try:
-        targets = get_targets()
-    except Exception as e:  # noqa: BLE001
-        print("Додаткові адреси недоступні:", type(e).__name__, e, file=sys.stderr)
-        targets = []
-    for t in targets:
-        tid = str(t.get("id", ""))
-        found = None
-        try:
-            data, street, house = await fetch_target(t)
-            found = (street, house)
-            print(f"[{tid}] графік отримано, днів:", len(data["days"]))
-            try:
-                data["notice"] = await asyncio.wait_for(fetch_notice(t["site"]), timeout=90)
-                print(f"[{tid}] оголошення ДТЕК:", json.dumps(data["notice"], ensure_ascii=False)[:400])
-            except Exception as e:  # noqa: BLE001
-                print(f"[{tid}] оголошення ДТЕК не прочитано:", type(e).__name__, e, file=sys.stderr)
-        except Exception as e:  # noqa: BLE001
-            data = {"ok": False, "error": f"{type(e).__name__}: {e}"[:600]}
-            print(f"[{tid}] помилка:", data["error"], file=sys.stderr)
-        try:
-            post({"id": tid, **data}, "/ingest/target")
-            if data.get("ok"):
-                sent[tid] = signature(data)
-        except Exception as e:  # noqa: BLE001
-            print(f"[{tid}] не вдалося надіслати:", type(e).__name__, e, file=sys.stderr)
-        if found:
-            spots.append({"label": tid, "id": tid, "path": "/ingest/target", "site": t["site"],
-                          "city": t["city"], "street": found[0], "house": found[1]})
 
     await watch(spots, sent)
 
